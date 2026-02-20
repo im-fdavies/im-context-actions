@@ -1,0 +1,63 @@
+# context.config.yml
+# Place this file at the root of your service repo.
+# Controls how the context update action behaves for this specific repo.
+
+# -----------------------------------------------------------------------
+# TRIGGER BRANCHES
+# Which branches trigger a context update on push.
+# -----------------------------------------------------------------------
+trigger_branches:
+  - main
+  - develop
+
+# -----------------------------------------------------------------------
+# AI MODEL CONFIG
+# provider: anthropic | openai | azure-openai
+# model: the model string for that provider
+# api_key_secret: the name of the GitHub secret containing the API key
+# -----------------------------------------------------------------------
+ai:
+  provider: anthropic
+  model: claude-opus-4-6
+  api_key_secret: ANTHROPIC_API_KEY   # org-level secret name
+  max_tokens: 8000
+
+# -----------------------------------------------------------------------
+# CONTEXT STANDARDS REPO
+# Where to find taxonomy.yaml for tag validation.
+# -----------------------------------------------------------------------
+standards:
+  repo: org/context-standards         # replace org with your GitHub org name
+  taxonomy_path: taxonomy.yaml
+
+# -----------------------------------------------------------------------
+# CONTEXT ROUTER REPO
+# Dispatched to after context files are updated.
+# -----------------------------------------------------------------------
+router:
+  repo: org/context-router            # replace org with your GitHub org name
+
+# -----------------------------------------------------------------------
+# STALE CHECK
+# How many days before a context file is considered stale and
+# queued for a re-verification pass against the current codebase.
+# -----------------------------------------------------------------------
+stale_threshold_days: 30
+
+# -----------------------------------------------------------------------
+# PATHS TO ALWAYS IGNORE
+# In addition to the defaults (node_modules, vendor, lock files).
+# -----------------------------------------------------------------------
+ignore_paths:
+  - ".context/**"     # never trigger on changes to context files themselves
+  - ".agent/**"
+  - "*.md"            # top-level markdown (README etc) doesn't affect context
+  - ".github/**"
+
+# -----------------------------------------------------------------------
+# BOT IDENTITY
+# Name and email used for commits made by the context update action.
+# -----------------------------------------------------------------------
+bot:
+  name: "context-bot[bot]"
+  email: "context-bot@users.noreply.github.com"

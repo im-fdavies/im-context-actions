@@ -1,0 +1,71 @@
+name: Context Stale Check
+
+on:
+  schedule:
+    # Every Sunday at 03:00 UTC
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+    inputs:
+      force_all:
+        description: 'Check all context files regardless of age'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  stale-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          cd .github/scripts
+          npm install
+
+      - name: Load config
+        id: config
+        run: |
+          CONFIG=$(cat context.config.yml | node -e "
+            const yaml = require('js-yaml');
+            const fs = require('fs');
+            process.stdout.write(JSON.stringify(yaml.load(fs.readFileSync('/dev/stdin', 'utf8'))));
+          ")
+          echo "config=$CONFIG" >> $GITHUB_OUTPUT
+
+      - name: Run stale check
+        id: stale_check
+        env:
+          AI_API_KEY: ${{ secrets[fromJSON(steps.config.outputs.config).ai.api_key_secret] }}
+          AI_PROVIDER: ${{ fromJSON(steps.config.outputs.config).ai.provider }}
+          AI_MODEL: ${{ fromJSON(steps.config.outputs.config).ai.model }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STANDARDS_REPO: ${{ fromJSON(steps.config.outputs.config).standards.repo }}
+          STALE_THRESHOLD_DAYS: ${{ fromJSON(steps.config.outputs.config).stale_threshold_days }}
+          FORCE_ALL: ${{ inputs.force_all || 'false' }}
+          REPO_NAME: ${{ github.repository }}
+        run: node .github/scripts/stale-check.js
+
+      - name: Commit refreshed context files
+        if: steps.stale_check.outputs.files_updated == 'true'
+        run: |
+          git config user.name "${{ fromJSON(steps.config.outputs.config).bot.name }}"
+          git config user.email "${{ fromJSON(steps.config.outputs.config).bot.email }}"
+          git add .context/
+          git diff --staged --quiet && echo "No stale context changes" && exit 0
+          git commit -m "chore(context): refresh stale context files [skip ci]
+
+          Stale check run: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          Files refreshed: ${{ steps.stale_check.outputs.updated_files_list }}"
+          git push

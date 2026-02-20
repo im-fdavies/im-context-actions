@@ -1,0 +1,12 @@
+{
+  "name": "context-update-scripts",
+  "version": "1.0.0",
+  "private": true,
+  "description": "GitHub Actions scripts for the context update pipeline",
+  "type": "commonjs",
+  "dependencies": {
+    "js-yaml": "^4.1.0",
+    "minimatch": "^9.0.4",
+    "node-fetch": "^3.3.2"
+  }
+}

@@ -1,0 +1,192 @@
+name: Context Update
+
+on:
+  push:
+    # Branch filtering is handled in the job itself using context.config.yml
+    # so we listen to all pushes and gate inside the job.
+    branches: ['**']
+
+permissions:
+  contents: write
+
+jobs:
+  update-context:
+    runs-on: ubuntu-latest
+
+    # ---------------------------------------------------------------
+    # LOOP PREVENTION — skip if this push came from the context bot
+    # ---------------------------------------------------------------
+    if: |
+      github.actor != 'context-bot[bot]' &&
+      !contains(github.event.head_commit.message, '[skip ci]') &&
+      !contains(github.event.head_commit.message, '[skip context]')
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history needed for diff
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          cd .github/scripts
+          npm install
+
+      - name: Load context.config.yml
+        id: config
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const yaml = require('js-yaml');
+            const fs = require('fs');
+
+            if (!fs.existsSync('context.config.yml')) {
+              core.setFailed('context.config.yml not found at repo root. See org/context-standards for setup instructions.');
+              return;
+            }
+
+            const config = yaml.load(fs.readFileSync('context.config.yml', 'utf8'));
+
+            // Check if current branch should trigger
+            const currentBranch = context.ref.replace('refs/heads/', '');
+            const triggerBranches = config.trigger_branches || ['main'];
+
+            if (!triggerBranches.includes(currentBranch)) {
+              core.info(`Branch ${currentBranch} is not in trigger_branches — skipping context update`);
+              core.setOutput('should_run', 'false');
+              return;
+            }
+
+            core.setOutput('should_run', 'true');
+            core.setOutput('config', JSON.stringify(config));
+            core.setOutput('ai_provider', config.ai.provider);
+            core.setOutput('ai_model', config.ai.model);
+            core.setOutput('api_key_secret_name', config.ai.api_key_secret);
+            core.setOutput('standards_repo', config.standards.repo);
+            core.setOutput('router_repo', config.router.repo);
+
+      - name: Get changed files
+        if: steps.config.outputs.should_run == 'true'
+        id: changed_files
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { execSync } = require('child_process');
+
+            // Get the diff between before and after this push
+            const before = context.payload.before;
+            const after = context.payload.after;
+
+            let changedFiles;
+            try {
+              const output = execSync(`git diff --name-status ${before} ${after}`).toString();
+              changedFiles = output.trim().split('\n')
+                .filter(Boolean)
+                .map(line => {
+                  const parts = line.split('\t');
+                  return { status: parts[0], path: parts[parts.length - 1] };
+                });
+            } catch {
+              // Fallback for first push / shallow clone edge cases
+              const output = execSync(`git show --name-status --format="" HEAD`).toString();
+              changedFiles = output.trim().split('\n')
+                .filter(Boolean)
+                .map(line => {
+                  const parts = line.split('\t');
+                  return { status: parts[0], path: parts[parts.length - 1] };
+                });
+            }
+
+            const config = JSON.parse('${{ steps.config.outputs.config }}');
+            const ignorePaths = config.ignore_paths || [];
+            const defaultIgnore = ['node_modules', 'vendor', 'package-lock.json', 'composer.lock', 'yarn.lock', '.pnp'];
+
+            // Filter out ignored paths
+            const filtered = changedFiles.filter(f => {
+              if (!f.path) return false;
+              for (const ignore of [...defaultIgnore, ...ignorePaths]) {
+                const pattern = ignore.replace(/\*\*/g, '.*').replace(/\*/g, '[^/]*');
+                if (new RegExp(pattern).test(f.path)) return false;
+              }
+              return true;
+            });
+
+            core.info(`Changed files after filtering: ${filtered.map(f => f.path).join(', ')}`);
+            core.setOutput('changed_files', JSON.stringify(filtered));
+            core.setOutput('commit_message', context.payload.head_commit?.message || '');
+            core.setOutput('commit_sha', context.payload.after);
+            core.setOutput('has_changes', (filtered.length > 0).toString());
+
+      - name: Run context update
+        if: |
+          steps.config.outputs.should_run == 'true' &&
+          steps.changed_files.outputs.has_changes == 'true'
+        id: context_update
+        env:
+          AI_API_KEY: ${{ secrets[steps.config.outputs.api_key_secret_name] }}
+          AI_PROVIDER: ${{ steps.config.outputs.ai_provider }}
+          AI_MODEL: ${{ steps.config.outputs.ai_model }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STANDARDS_REPO: ${{ steps.config.outputs.standards_repo }}
+          CHANGED_FILES: ${{ steps.changed_files.outputs.changed_files }}
+          COMMIT_SHA: ${{ steps.changed_files.outputs.commit_sha }}
+          COMMIT_MESSAGE: ${{ steps.changed_files.outputs.commit_message }}
+          REPO_NAME: ${{ github.repository }}
+        run: node .github/scripts/context-update.js
+
+      - name: Commit updated context files
+        if: steps.context_update.outputs.files_updated == 'true'
+        run: |
+          git config user.name "${{ fromJSON(steps.config.outputs.config).bot.name }}"
+          git config user.email "${{ fromJSON(steps.config.outputs.config).bot.email }}"
+          git add .context/
+          git diff --staged --quiet && echo "No context changes to commit" && exit 0
+          git commit -m "chore(context): update context files [skip ci]
+
+          Updated by context-update action
+          Triggered by: ${{ steps.changed_files.outputs.commit_sha }}
+          Files changed: ${{ steps.context_update.outputs.updated_files_list }}"
+          git push
+
+      - name: Dispatch to context-router
+        if: steps.context_update.outputs.files_updated == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CONTEXT_ROUTER_PAT }}
+          script: |
+            const [owner, repo] = '${{ steps.config.outputs.router_repo }}'.split('/');
+            await github.rest.repos.createDispatchEvent({
+              owner,
+              repo,
+              event_type: 'context-files-updated',
+              client_payload: {
+                service: context.repo.repo,
+                repo: context.repo.owner + '/' + context.repo.repo,
+                updated_files: JSON.parse('${{ steps.context_update.outputs.updated_files_list_json }}')
+              }
+            });
+            core.info('Dispatched routing index rebuild to context-router');
+
+      - name: Dispatch pending taxonomy proposals
+        if: steps.context_update.outputs.has_pending_tags == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CONTEXT_STANDARDS_PAT }}
+          script: |
+            const [owner, repo] = '${{ steps.config.outputs.standards_repo }}'.split('/');
+            await github.rest.repos.createDispatchEvent({
+              owner,
+              repo,
+              event_type: 'propose-taxonomy-tags',
+              client_payload: {
+                service: context.repo.repo,
+                repo: context.repo.owner + '/' + context.repo.repo,
+                proposed_tags: JSON.parse('${{ steps.context_update.outputs.pending_tags_json }}')
+              }
+            });
+            core.info('Dispatched taxonomy proposals to context-standards');

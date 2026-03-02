@@ -2,70 +2,54 @@ name: Context Stale Check
 
 on:
   schedule:
-    # Every Sunday at 03:00 UTC
-    - cron: '0 3 * * 0'
+    # Every Monday at 09:00 UTC
+    - cron: '0 9 * * 1'
   workflow_dispatch:
-    inputs:
-      force_all:
-        description: 'Check all context files regardless of age'
-        type: boolean
-        default: false
 
 permissions:
   contents: write
+  issues: write
 
 jobs:
   stale-check:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.CONTEXT_STANDARDS_PAT || github.token }}
 
-      - name: Setup Node
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
       - name: Install dependencies
-        run: |
-          cd .github/scripts
-          npm install
-
-      - name: Load config
-        id: config
-        run: |
-          CONFIG=$(cat context.config.yml | node -e "
-            const yaml = require('js-yaml');
-            const fs = require('fs');
-            process.stdout.write(JSON.stringify(yaml.load(fs.readFileSync('/dev/stdin', 'utf8'))));
-          ")
-          echo "config=$CONFIG" >> $GITHUB_OUTPUT
+        working-directory: .github/scripts
+        run: npm install
 
       - name: Run stale check
         id: stale_check
         env:
-          AI_API_KEY: ${{ secrets[fromJSON(steps.config.outputs.config).ai.api_key_secret] }}
-          AI_PROVIDER: ${{ fromJSON(steps.config.outputs.config).ai.provider }}
-          AI_MODEL: ${{ fromJSON(steps.config.outputs.config).ai.model }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          STANDARDS_REPO: ${{ fromJSON(steps.config.outputs.config).standards.repo }}
-          STALE_THRESHOLD_DAYS: ${{ fromJSON(steps.config.outputs.config).stale_threshold_days }}
-          FORCE_ALL: ${{ inputs.force_all || 'false' }}
-          REPO_NAME: ${{ github.repository }}
-        run: node .github/scripts/stale-check.js
+          GITHUB_TOKEN: ${{ github.token }}
+          CONTEXT_STANDARDS_PAT: ${{ secrets.CONTEXT_STANDARDS_PAT }}
+          # AI provider keys - action reads config to determine which to use
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        working-directory: .github/scripts
+        run: node stale-check.js
 
-      - name: Commit refreshed context files
-        if: steps.stale_check.outputs.files_updated == 'true'
+      - name: Summary
+        if: always()
         run: |
-          git config user.name "${{ fromJSON(steps.config.outputs.config).bot.name }}"
-          git config user.email "${{ fromJSON(steps.config.outputs.config).bot.email }}"
-          git add .context/
-          git diff --staged --quiet && echo "No stale context changes" && exit 0
-          git commit -m "chore(context): refresh stale context files [skip ci]
-
-          Stale check run: $(date -u +%Y-%m-%dT%H:%M:%SZ)
-          Files refreshed: ${{ steps.stale_check.outputs.updated_files_list }}"
-          git push
+          echo "### Context Stale Check Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Files checked:** ${{ steps.stale_check.outputs.files_checked || '0' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Files refreshed:** ${{ steps.stale_check.outputs.files_refreshed || '0' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Files flagged:** ${{ steps.stale_check.outputs.files_flagged || '0' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Errors:** ${{ steps.stale_check.outputs.errors || '0' }}" >> $GITHUB_STEP_SUMMARY

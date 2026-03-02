@@ -1,12 +1,22 @@
 {
-  "name": "context-update-scripts",
+  "name": "context-actions-scripts",
   "version": "1.0.0",
-  "private": true,
-  "description": "GitHub Actions scripts for the context update pipeline",
-  "type": "commonjs",
+  "description": "Scripts for context-actions GitHub workflows",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "context-update": "node context-update.js",
+    "stale-check": "node stale-check.js"
+  },
   "dependencies": {
+    "openai": "^4.70.0",
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@octokit/rest": "^21.0.0",
+    "@actions/core": "^1.10.1",
+    "@actions/github": "^6.0.0",
     "js-yaml": "^4.1.0",
-    "minimatch": "^9.0.4",
-    "node-fetch": "^3.3.2"
+    "micromatch": "^4.0.8"
   }
 }

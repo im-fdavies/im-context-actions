@@ -1,354 +1,420 @@
 /**
  * context-update.js
- * Main script for the context update action.
- * Run by: .github/workflows/context-update.yml
+ * Entrypoint for the context update workflow.
  *
- * Flow:
- * 1. Parse changed files from env
- * 2. Map to affected context docs via covers-paths
- * 3. For each affected doc: call AI to update it
- * 4. Special-case constraints-and-gotchas.md (append-only + gotcha detection)
- * 5. Validate tags against taxonomy
- * 6. Write updated files
- * 7. Set action outputs
+ * Triggered on push to trigger branches. Finds context docs affected by
+ * changed files and regenerates them using the Anthropic API.
  */
 
-const fs = require('fs');
-const path = require('path');
-const yaml = require('js-yaml');
+import fs from 'fs';
+import path from 'path';
+import { execSync } from 'child_process';
+import * as core from '@actions/core';
+import yaml from 'js-yaml';
+import micromatch from 'micromatch';
 
-const { mapChangedFilesToContextDocs, readChangedFileContents } = require('./utils/diff-mapper');
-const { parseFrontmatter, stampLastUpdated, updateFrontmatter } = require('./utils/frontmatter');
-const { callAI } = require('./utils/ai-client');
-const { fetchTaxonomy, buildApprovedTagSets, validateTags, buildPendingProposals } = require('./utils/taxonomy');
+import { parse, serialize, validate, updateLastUpdated } from './utils/frontmatter.js';
+import { matchesCoversPaths, mapChangedFilesToDocs } from './utils/glob-matcher.js';
+import { regenerateContextDoc, delay } from './utils/ai-client.js';
+import { createCommit } from './utils/github-client.js';
+import { validateIntent } from './utils/taxonomy.js';
 
 // -----------------------------------------------------------------------
-// Environment
+// Constants
 // -----------------------------------------------------------------------
 const REPO_ROOT = process.cwd();
-const CHANGED_FILES = JSON.parse(process.env.CHANGED_FILES || '[]');
-const COMMIT_SHA = process.env.COMMIT_SHA || '';
+const CONTEXT_DIR = path.join(REPO_ROOT, '.context');
+const MAX_FILE_CHARS = 6000;
+const MAX_TOTAL_CHARS = 40000;
+const DRY_RUN = process.env.DRY_RUN === 'true';
+
+// -----------------------------------------------------------------------
+// Environment variables (set by the workflow)
+// -----------------------------------------------------------------------
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const CONTEXT_STANDARDS_PAT = process.env.CONTEXT_STANDARDS_PAT;
+const GITHUB_REPOSITORY = process.env.GITHUB_REPOSITORY || '';
+const GITHUB_REF_NAME = process.env.GITHUB_REF_NAME || 'main';
+const BEFORE_SHA = process.env.BEFORE_SHA || '';
+const AFTER_SHA = process.env.AFTER_SHA || '';
 const COMMIT_MESSAGE = process.env.COMMIT_MESSAGE || '';
-const STANDARDS_REPO = process.env.STANDARDS_REPO || '';
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
-const TODAY = new Date().toISOString().split('T')[0];
-
-// Detect if this commit has a [gotcha] tag in the message
-const IS_GOTCHA_COMMIT = /\[gotcha\]/i.test(COMMIT_MESSAGE);
 
 // -----------------------------------------------------------------------
-// GitHub Actions output helper
+// Helpers
 // -----------------------------------------------------------------------
-function setOutput(name, value) {
-  const outputFile = process.env.GITHUB_OUTPUT;
-  if (outputFile) {
-    fs.appendFileSync(outputFile, `${name}=${typeof value === 'string' ? value : JSON.stringify(value)}\n`);
-  } else {
-    console.log(`OUTPUT ${name}=${value}`);
+
+function getToday() {
+  return new Date().toISOString().split('T')[0];
+}
+
+/**
+ * Load the context.config.yml file.
+ */
+function loadConfig() {
+  const configPath = path.join(REPO_ROOT, 'context.config.yml');
+  if (!fs.existsSync(configPath)) {
+    throw new Error('context.config.yml not found at repo root');
   }
+  return yaml.load(fs.readFileSync(configPath, 'utf8'));
 }
 
-// -----------------------------------------------------------------------
-// Build the system prompt for context doc updates
-// -----------------------------------------------------------------------
-function buildSystemPrompt() {
-  return `You are a senior software architect maintaining AI-readable context documentation for a codebase.
+/**
+ * Get the list of files changed in this push.
+ */
+function getChangedFiles() {
+  let output;
 
-Your job is to update a specific .context/*.md file based on changes that were just pushed to the repository.
-
-RULES — non-negotiable:
-1. Return ONLY the updated markdown file content. No explanation, no preamble, no code fences around the whole response.
-2. Preserve the YAML frontmatter block exactly — only update these frontmatter fields if needed: tags, covers-paths, confidence, intents. Never change title, version, generated, scope.
-3. Update the body content to accurately reflect the changed code. Be surgical — only update sections that are actually affected by the diff.
-4. If a section is unaffected, reproduce it exactly as-is.
-5. Never invent code examples. Only reference actual code from the diff or existing codebase context provided.
-6. If the diff shows a deletion (status: D), update the relevant section to remove references to the deleted code.
-7. Confidence score: set this honestly. If you can fully verify the update from the diff provided, use 0.85-0.95. If you're inferring, use 0.65-0.80.
-8. Tags: only use tags that are listed in the APPROVED TAXONOMY provided. If you need a tag not in the taxonomy, add it to tags-pending-approval as: { tag: "name", category: "category", reason: "why it's needed" }.
-9. DO NOT touch constraints-and-gotchas.md body content — that file is handled separately.`;
-}
-
-// -----------------------------------------------------------------------
-// Build the user prompt for a specific context doc update
-// -----------------------------------------------------------------------
-function buildUpdatePrompt(contextDoc, changedFileContents, approvedTagSets) {
-  const approvedTagsSummary = Object.entries(approvedTagSets)
-    .map(([cat, set]) => `${cat}: [${Array.from(set).join(', ')}]`)
-    .join('\n');
-
-  const changedFilesFormatted = changedFileContents
-    .map(f => {
-      if (f.status === 'D') return `### DELETED: ${f.path}\n(file was removed)`;
-      return `### ${f.status === 'A' ? 'ADDED' : 'MODIFIED'}: ${f.path}\n\`\`\`\n${f.content}\n\`\`\``;
-    })
-    .join('\n\n');
-
-  return `## Context Document to Update
-
-File: ${contextDoc.relativePath}
-
-Current content:
----
-${yaml.dump(contextDoc.frontmatter)}---
-${contextDoc.body}
-
----
-
-## Changed Source Files (the diff that triggered this update)
-
-${changedFilesFormatted}
-
----
-
-## Approved Taxonomy Tags
-
-${approvedTagsSummary}
-
----
-
-Update the context document to accurately reflect these changes.
-Return the complete updated file content — frontmatter block included.`;
-}
-
-// -----------------------------------------------------------------------
-// Build gotcha detection prompt
-// -----------------------------------------------------------------------
-function buildGotchaPrompt(commitMessage, changedFileContents, existingGotchas) {
-  const changedSummary = changedFileContents
-    .filter(f => f.content)
-    .map(f => `${f.path}:\n${f.content?.slice(0, 2000) || ''}`)
-    .join('\n\n---\n\n');
-
-  return `You are reviewing a code commit to determine if it should be recorded as a "gotcha" — a non-obvious problem that was solved and should be documented so others don't hit the same issue.
-
-## Commit Message
-${commitMessage}
-
-## Changed Files
-${changedSummary}
-
-## Existing Gotcha IDs (for sequential numbering)
-${existingGotchas.length > 0 ? existingGotchas.map(g => g.id).join(', ') : 'None yet — start at GOTCHA-001'}
-
----
-
-TASK:
-1. Determine if this commit represents a non-obvious problem worth documenting.
-2. A commit is worth a gotcha entry if: it fixes something that took significant investigation, the fix is non-obvious, or future developers would likely hit the same wall.
-3. If NOT worth a gotcha entry, respond with exactly: NO_GOTCHA
-4. If YES, respond with exactly this format and nothing else:
-
-### [GOTCHA-NNN] <Short descriptive title>
-
-**tags:** <comma-separated relevant tags>
-**severity:** critical | high | medium | low
-**added-commit:** ${COMMIT_SHA}
-**added-date:** ${TODAY}
-**disciplines:** <comma-separated discipline tags>
-**affects-paths:**
-  - <path>
-
-**Problem**
-<What happens and why it's non-obvious>
-
-**What Was Tried**
-<Approaches that don't work and why — infer from commit message and diff if not explicit>
-
-**Solution**
-<What actually works — based on the diff>
-
-**Reference**
-Commit: ${COMMIT_SHA}`;
-}
-
-// -----------------------------------------------------------------------
-// Parse existing gotcha IDs from constraints-and-gotchas.md
-// -----------------------------------------------------------------------
-function parseExistingGotchaIds(content) {
-  const matches = content.matchAll(/###\s+\[(GOTCHA-\d+)\]/g);
-  return Array.from(matches).map(m => ({ id: m[1] }));
-}
-
-// -----------------------------------------------------------------------
-// MAIN
-// -----------------------------------------------------------------------
-async function main() {
-  console.log(`\n=== Context Update Action ===`);
-  console.log(`Commit: ${COMMIT_SHA}`);
-  console.log(`Gotcha commit: ${IS_GOTCHA_COMMIT}`);
-  console.log(`Changed files: ${CHANGED_FILES.length}`);
-
-  if (CHANGED_FILES.length === 0) {
-    console.log('No relevant files changed — exiting');
-    setOutput('files_updated', 'false');
-    return;
-  }
-
-  // 1. Fetch taxonomy
-  console.log(`\nFetching taxonomy from ${STANDARDS_REPO}...`);
-  let approvedTagSets = {};
   try {
-    const taxonomy = await fetchTaxonomy(STANDARDS_REPO, GITHUB_TOKEN);
-    approvedTagSets = buildApprovedTagSets(taxonomy);
-    console.log(`✓ Taxonomy loaded. Categories: ${Object.keys(approvedTagSets).join(', ')}`);
+    if (BEFORE_SHA && AFTER_SHA && BEFORE_SHA !== '0000000000000000000000000000000000000000') {
+      // Normal push with before/after
+      output = execSync(`git diff --name-status ${BEFORE_SHA} ${AFTER_SHA}`, { encoding: 'utf8' });
+    } else {
+      // First push or force push - compare with parent
+      output = execSync(`git show --name-status --format="" HEAD`, { encoding: 'utf8' });
+    }
   } catch (e) {
-    console.warn(`⚠ Could not fetch taxonomy: ${e.message}. Proceeding without tag validation.`);
+    core.warning(`Failed to get changed files via git diff: ${e.message}`);
+    output = execSync(`git show --name-status --format="" HEAD`, { encoding: 'utf8' });
   }
 
-  // 2. Map changed files to context docs
-  const affectedDocs = mapChangedFilesToContextDocs(CHANGED_FILES, REPO_ROOT);
-  console.log(`\nAffected context docs: ${affectedDocs.map(d => d.relativePath).join(', ')}`);
+  const files = output
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map(line => {
+      const parts = line.split('\t');
+      return {
+        status: parts[0],
+        path: parts[parts.length - 1]
+      };
+    });
 
-  if (affectedDocs.length === 0) {
-    console.log('No context docs affected by these changes — exiting');
-    setOutput('files_updated', 'false');
+  // Filter out ignored paths
+  const ignorePaths = ['node_modules/**', 'vendor/**', '**/*.lock', '.context/**', '.github/**'];
+
+  return files.filter(f => {
+    if (!f.path) return false;
+    return !micromatch.isMatch(f.path, ignorePaths, { dot: true });
+  });
+}
+
+/**
+ * Load all context docs from .context/ directory.
+ */
+function loadContextDocs() {
+  if (!fs.existsSync(CONTEXT_DIR)) {
+    return [];
+  }
+
+  const files = fs.readdirSync(CONTEXT_DIR).filter(f => f.endsWith('.md'));
+  const docs = [];
+
+  for (const filename of files) {
+    const filePath = path.join(CONTEXT_DIR, filename);
+    const content = fs.readFileSync(filePath, 'utf8');
+    const parsed = parse(content);
+
+    if (!parsed) {
+      core.warning(`Skipping ${filename}: invalid or missing frontmatter`);
+      continue;
+    }
+
+    const validation = validate(parsed.meta);
+    if (!validation.valid) {
+      core.warning(`Skipping ${filename}: missing required fields: ${validation.missing.join(', ')}`);
+      continue;
+    }
+
+    docs.push({
+      path: `.context/${filename}`,
+      filePath,
+      filename,
+      content,
+      meta: parsed.meta,
+      body: parsed.body,
+      coversPaths: parsed.meta['covers-paths'] || []
+    });
+  }
+
+  return docs;
+}
+
+/**
+ * Read source files covered by a context doc.
+ * Respects truncation limits.
+ */
+function readSourceFiles(coversPaths, maxTotalChars = MAX_TOTAL_CHARS) {
+  const files = [];
+  let totalChars = 0;
+
+  // Expand globs to actual files
+  for (const pattern of coversPaths) {
+    try {
+      const matches = execSync(`git ls-files "${pattern}" 2>/dev/null || true`, { encoding: 'utf8' })
+        .trim()
+        .split('\n')
+        .filter(Boolean);
+
+      for (const filePath of matches) {
+        if (totalChars >= maxTotalChars) {
+          core.warning(`Token budget reached (${maxTotalChars} chars). Some source files omitted.`);
+          break;
+        }
+
+        const fullPath = path.join(REPO_ROOT, filePath);
+        if (!fs.existsSync(fullPath)) continue;
+
+        try {
+          let content = fs.readFileSync(fullPath, 'utf8');
+
+          // Truncate individual files
+          if (content.length > MAX_FILE_CHARS) {
+            core.warning(`Truncating ${filePath} from ${content.length} to ${MAX_FILE_CHARS} chars`);
+            content = content.slice(0, MAX_FILE_CHARS) + '\n\n[... truncated ...]';
+          }
+
+          // Check total budget
+          if (totalChars + content.length > maxTotalChars) {
+            const remaining = maxTotalChars - totalChars;
+            content = content.slice(0, remaining) + '\n\n[... truncated for budget ...]';
+          }
+
+          files.push({ path: filePath, content });
+          totalChars += content.length;
+        } catch (e) {
+          core.warning(`Failed to read ${filePath}: ${e.message}`);
+        }
+      }
+    } catch {
+      // Pattern didn't match anything
+    }
+  }
+
+  return files;
+}
+
+/**
+ * Validate that AI response has valid frontmatter.
+ */
+function validateAIResponse(response) {
+  const parsed = parse(response);
+  if (!parsed) {
+    return { valid: false, error: 'No valid frontmatter in AI response' };
+  }
+
+  const validation = validate(parsed.meta);
+  if (!validation.valid) {
+    return { valid: false, error: `Missing fields in AI response: ${validation.missing.join(', ')}` };
+  }
+
+  return { valid: true, parsed };
+}
+
+// -----------------------------------------------------------------------
+// Main
+// -----------------------------------------------------------------------
+
+async function main() {
+  const today = getToday();
+
+  core.info('=== Context Update Action ===');
+  core.info(`Date: ${today}`);
+  core.info(`Repository: ${GITHUB_REPOSITORY}`);
+  core.info(`Branch: ${GITHUB_REF_NAME}`);
+  core.info(`Dry run: ${DRY_RUN}`);
+
+  // Check for skip conditions
+  if (COMMIT_MESSAGE.includes('[skip ci]')) {
+    core.info('Commit message contains [skip ci] - skipping');
     return;
   }
 
-  // 3. Read changed file contents (chunked)
-  const changedFileContents = readChangedFileContents(CHANGED_FILES, REPO_ROOT);
+  // Load config
+  const config = loadConfig();
+  const triggerBranches = config.context?.trigger_branches || ['main'];
+  
+  // AI config - read from config file
+  const aiConfig = config.context?.ai || {};
+  const provider = aiConfig.provider || 'openai';
+  const model = aiConfig.model || 'gpt-4o';
+  const apiKeySecretName = aiConfig.api_key_secret || 'OPENAI_API_KEY';
+  const apiKey = process.env[apiKeySecretName] || process.env.AI_API_KEY || process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY;
 
+  core.info(`AI provider: ${provider}, model: ${model}`);
+
+  // Check if current branch should trigger
+  if (!triggerBranches.includes(GITHUB_REF_NAME)) {
+    core.info(`Branch ${GITHUB_REF_NAME} not in trigger_branches [${triggerBranches.join(', ')}] - skipping`);
+    return;
+  }
+
+  // Get changed files
+  const changedFiles = getChangedFiles();
+  core.info(`Changed files: ${changedFiles.length}`);
+
+  if (changedFiles.length === 0) {
+    core.info('No relevant files changed - skipping');
+    core.setOutput('files_updated', 'false');
+    return;
+  }
+
+  for (const f of changedFiles) {
+    core.info(`  ${f.status} ${f.path}`);
+  }
+
+  // Load context docs
+  const contextDocs = loadContextDocs();
+  core.info(`Context docs found: ${contextDocs.length}`);
+
+  if (contextDocs.length === 0) {
+    core.info('No context docs found in .context/ - skipping');
+    core.setOutput('files_updated', 'false');
+    return;
+  }
+
+  // Map changed files to context docs
+  const changedPaths = changedFiles.map(f => f.path);
+  const docToChangedFiles = mapChangedFilesToDocs(changedPaths, contextDocs);
+
+  core.info(`Context docs affected: ${docToChangedFiles.size}`);
+
+  if (docToChangedFiles.size === 0) {
+    core.info('No context docs cover the changed files - skipping');
+    core.setOutput('files_updated', 'false');
+    return;
+  }
+
+  // Process each affected doc
   const updatedFiles = [];
-  const allPendingTags = [];
+  const errors = [];
+  let checked = 0;
+  let regenerated = 0;
+  let skipped = 0;
 
-  for (const doc of affectedDocs) {
-    console.log(`\nProcessing: ${doc.relativePath}`);
+  for (const [docPath, affectedFiles] of docToChangedFiles) {
+    checked++;
+    const doc = contextDocs.find(d => d.path === docPath);
+    if (!doc) continue;
 
-    // ---------------------------------------------------------------
-    // SPECIAL CASE: constraints-and-gotchas.md (append-only)
-    // ---------------------------------------------------------------
-    if (doc.relativePath.includes('constraints-and-gotchas')) {
-      const fullContent = fs.readFileSync(doc.contextFilePath, 'utf8');
-      const existingGotchas = parseExistingGotchaIds(fullContent);
+    core.info(`\nProcessing: ${doc.filename}`);
+    core.info(`  Triggered by: ${affectedFiles.join(', ')}`);
 
-      // Only run gotcha detection if [gotcha] in commit message OR it's a push to main
-      const shouldCheckGotcha = IS_GOTCHA_COMMIT || process.env.FORCE_GOTCHA_CHECK === 'true';
-
-      if (!shouldCheckGotcha) {
-        console.log('  Skipping gotcha check — no [gotcha] tag in commit message');
-        // Still stamp the last-updated fields
-        const stamped = stampLastUpdated(fullContent, COMMIT_SHA, TODAY);
-        fs.writeFileSync(doc.contextFilePath, stamped);
-        updatedFiles.push(doc.relativePath);
-        continue;
-      }
-
-      console.log('  Running gotcha detection...');
-      const gotchaResponse = await callAI(
-        `You are a technical documentation assistant. Analyze this commit and determine if it warrants a gotcha entry. Be conservative — only flag genuinely non-obvious problems.`,
-        buildGotchaPrompt(COMMIT_MESSAGE, changedFileContents, existingGotchas)
-      );
-
-      if (gotchaResponse.trim() === 'NO_GOTCHA') {
-        console.log('  No gotcha detected');
-        const stamped = stampLastUpdated(fullContent, COMMIT_SHA, TODAY);
-        fs.writeFileSync(doc.contextFilePath, stamped);
-        updatedFiles.push(doc.relativePath);
-        continue;
-      }
-
-      // Append the new gotcha entry to the Gotchas section
-      const gotchasSection = '## Gotchas';
-      const insertionPoint = fullContent.indexOf(gotchasSection);
-
-      let updatedContent;
-      if (insertionPoint === -1) {
-        // Append to end if section not found
-        updatedContent = fullContent.trimEnd() + '\n\n' + gotchaResponse.trim() + '\n';
-      } else {
-        // Find the end of the Gotchas section (next ## heading or end of file)
-        const afterSection = fullContent.indexOf('\n## ', insertionPoint + gotchasSection.length);
-        const insertAt = afterSection === -1 ? fullContent.length : afterSection;
-        updatedContent = fullContent.slice(0, insertAt) + '\n\n' + gotchaResponse.trim() + '\n' + fullContent.slice(insertAt);
-      }
-
-      const stamped = stampLastUpdated(updatedContent, COMMIT_SHA, TODAY);
-      fs.writeFileSync(doc.contextFilePath, stamped);
-      updatedFiles.push(doc.relativePath);
-      console.log(`  ✓ Gotcha entry appended`);
+    // Skip constraints-and-gotchas files (append-only)
+    if (doc.filename.includes('constraints-and-gotchas')) {
+      core.info('  Skipping: append-only file (constraints-and-gotchas)');
+      skipped++;
       continue;
     }
 
-    // ---------------------------------------------------------------
-    // STANDARD context doc update
-    // ---------------------------------------------------------------
-    const relevantFiles = changedFileContents.filter(f =>
-      doc.matchedBy.includes(f.path)
-    );
+    // Read source files
+    const sourceFiles = readSourceFiles(doc.coversPaths);
+    core.info(`  Source files read: ${sourceFiles.length}`);
 
-    if (relevantFiles.length === 0) {
-      console.log('  No relevant file contents — skipping');
+    if (sourceFiles.length === 0) {
+      core.warning(`  No source files found for covers-paths - skipping`);
+      skipped++;
       continue;
     }
 
+    if (DRY_RUN) {
+      core.info(`  [DRY RUN] Would regenerate this doc`);
+      continue;
+    }
+
+    // Call AI to regenerate
     try {
-      const updatedContent = await callAI(
-        buildSystemPrompt(),
-        buildUpdatePrompt(doc, relevantFiles, approvedTagSets)
+      core.info(`  Calling ${provider} API...`);
+      const updatedContent = await regenerateContextDoc(
+        doc.content,
+        sourceFiles,
+        today,
+        { provider, model, apiKey }
       );
 
-      if (!updatedContent || updatedContent.trim().length < 50) {
-        console.warn(`  ⚠ AI returned empty/short response — skipping`);
+      // Validate AI response
+      const validation = validateAIResponse(updatedContent);
+      if (!validation.valid) {
+        core.error(`  AI response validation failed: ${validation.error}`);
+        errors.push({ file: doc.filename, error: validation.error });
         continue;
       }
 
-      // Stamp last-updated fields
-      const stamped = stampLastUpdated(updatedContent, COMMIT_SHA, TODAY);
+      // Write updated file
+      fs.writeFileSync(doc.filePath, updatedContent);
+      updatedFiles.push(doc.path);
+      regenerated++;
+      core.info(`  ✓ Updated`);
 
-      // Validate tags in the updated content
-      const parsed = parseFrontmatter(stamped);
-      if (parsed && Object.keys(approvedTagSets).length > 0) {
-        const validation = validateTags(parsed.frontmatter.tags || {}, approvedTagSets);
-        if (!validation.valid) {
-          console.warn(`  ⚠ Unknown tags found: ${validation.unknown.map(t => `${t.category}/${t.tag}`).join(', ')}`);
-          const proposals = buildPendingProposals(
-            validation.unknown,
-            doc.relativePath
-          );
-          allPendingTags.push(...proposals);
-
-          // Move unknown tags to pending-approval in the file
-          const pendingApproval = [
-            ...(parsed.frontmatter['tags-pending-approval'] || []),
-            ...proposals
-          ];
-          const withPending = updateFrontmatter(stamped, {
-            tags: validation.approved,
-            'tags-pending-approval': pendingApproval
-          });
-          fs.writeFileSync(doc.contextFilePath, withPending);
-        } else {
-          fs.writeFileSync(doc.contextFilePath, stamped);
-        }
-      } else {
-        fs.writeFileSync(doc.contextFilePath, stamped);
-      }
-
-      updatedFiles.push(doc.relativePath);
-      console.log(`  ✓ Updated`);
+      // Rate limit delay
+      await delay(1500);
 
     } catch (e) {
-      console.error(`  ✗ Failed to update ${doc.relativePath}: ${e.message}`);
-      // Don't crash the whole action for one doc — log and continue
+      core.error(`  ✗ Failed: ${e.message}`);
+      errors.push({ file: doc.filename, error: e.message });
     }
   }
 
-  // -----------------------------------------------------------------------
-  // Set action outputs
-  // -----------------------------------------------------------------------
-  const filesUpdated = updatedFiles.length > 0;
-  setOutput('files_updated', filesUpdated.toString());
-  setOutput('updated_files_list', updatedFiles.join(', '));
-  setOutput('updated_files_list_json', JSON.stringify(updatedFiles));
-  setOutput('has_pending_tags', (allPendingTags.length > 0).toString());
-  setOutput('pending_tags_json', JSON.stringify(allPendingTags));
+  // Summary
+  core.info('\n=== Summary ===');
+  core.info(`Files checked: ${checked}`);
+  core.info(`Files regenerated: ${regenerated}`);
+  core.info(`Files skipped: ${skipped}`);
+  core.info(`Errors: ${errors.length}`);
 
-  console.log(`\n=== Done ===`);
-  console.log(`Files updated: ${updatedFiles.length}`);
-  console.log(`Pending taxonomy proposals: ${allPendingTags.length}`);
+  if (errors.length > 0) {
+    core.warning('Errors encountered:');
+    for (const err of errors) {
+      core.warning(`  ${err.file}: ${err.error}`);
+    }
+  }
+
+  // Commit changes if any
+  if (updatedFiles.length > 0 && !DRY_RUN) {
+    core.info('\nCommitting changes...');
+
+    const token = CONTEXT_STANDARDS_PAT || GITHUB_TOKEN;
+    const [owner, repo] = GITHUB_REPOSITORY.split('/');
+
+    // Read updated file contents for commit
+    const filesToCommit = updatedFiles.map(p => ({
+      path: p,
+      content: fs.readFileSync(path.join(REPO_ROOT, p), 'utf8')
+    }));
+
+    try {
+      const result = await createCommit({
+        owner,
+        repo,
+        branch: GITHUB_REF_NAME,
+        files: filesToCommit,
+        message: `chore(context): auto-update context docs [skip ci]\n\nUpdated: ${updatedFiles.join(', ')}`,
+        token
+      });
+
+      if (result) {
+        core.info(`✓ Committed: ${result.sha}`);
+      } else {
+        core.info('No changes to commit');
+      }
+    } catch (e) {
+      core.error(`Failed to commit: ${e.message}`);
+      // Don't fail the whole run for commit issues
+    }
+  }
+
+  // Set outputs
+  core.setOutput('files_updated', (updatedFiles.length > 0).toString());
+  core.setOutput('updated_files', updatedFiles.join(','));
+  core.setOutput('files_checked', checked.toString());
+  core.setOutput('files_regenerated', regenerated.toString());
+  core.setOutput('files_skipped', skipped.toString());
+  core.setOutput('errors', errors.length.toString());
 }
 
+// Run
 main().catch(e => {
-  console.error('Context update action failed:', e);
+  core.error(`Context update action failed: ${e.message}`);
+  core.setFailed(e.message);
   process.exit(1);
 });
+

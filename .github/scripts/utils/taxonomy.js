@@ -1,109 +1,119 @@
 /**
  * utils/taxonomy.js
- * Validates tags in context file frontmatter against the approved taxonomy.
- * Fetches taxonomy.yaml from the context-standards repo at runtime.
+ * Valid intents and tag categories for context file validation.
+ * This is the local source of truth — no external taxonomy repo dependency.
  */
-
-const yaml = require('js-yaml');
-const https = require('https');
-
-let _cachedTaxonomy = null;
 
 /**
- * Fetch taxonomy.yaml from the context-standards repo.
- * Cached in memory for the duration of the action run.
+ * Valid intent values for context documents.
+ * These describe the primary purpose of the context file.
  */
-async function fetchTaxonomy(standardsRepo, githubToken) {
-  if (_cachedTaxonomy) return _cachedTaxonomy;
-
-  const [owner, repo] = standardsRepo.split('/');
-  const url = `https://api.github.com/repos/${owner}/${repo}/contents/taxonomy.yaml`;
-
-  const content = await new Promise((resolve, reject) => {
-    const options = {
-      hostname: 'api.github.com',
-      path: `/repos/${owner}/${repo}/contents/taxonomy.yaml`,
-      headers: {
-        'Authorization': `Bearer ${githubToken}`,
-        'Accept': 'application/vnd.github.v3+json',
-        'User-Agent': 'context-update-action'
-      }
-    };
-
-    https.get(options, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try {
-          const json = JSON.parse(data);
-          const decoded = Buffer.from(json.content, 'base64').toString('utf8');
-          resolve(decoded);
-        } catch (e) {
-          reject(new Error(`Failed to decode taxonomy.yaml: ${e.message}`));
-        }
-      });
-    }).on('error', reject);
-  });
-
-  _cachedTaxonomy = yaml.load(content);
-  return _cachedTaxonomy;
-}
+export const VALID_INTENTS = [
+  'CODE_GENERATION',     // Context for AI code generation tasks
+  'ARCHITECTURE',        // High-level system architecture documentation
+  'API_REFERENCE',       // API endpoints and contract documentation
+  'DATA_MODEL',          // Database schemas and data structures
+  'INTEGRATION',         // External service integrations
+  'SECURITY',            // Security patterns and considerations
+  'TESTING',             // Testing strategies and patterns
+  'DEPLOYMENT',          // Deployment and infrastructure context
+  'CONSTRAINTS',         // Gotchas, constraints, and edge cases
+  'ONBOARDING'           // Developer onboarding context
+];
 
 /**
- * Build a flat set of all approved tags per category.
- * { stack: Set, disciplines: Set, domain: Set, sensitivity: Set }
+ * Valid tag categories.
+ * Tags should be organized under these categories in frontmatter.
  */
-function buildApprovedTagSets(taxonomy) {
-  const sets = {};
-  for (const [category, def] of Object.entries(taxonomy.categories || {})) {
-    sets[category] = new Set(
-      Object.entries(def.tags || {})
-        .filter(([, v]) => v.status === 'approved')
-        .map(([k]) => k)
-    );
+export const TAG_CATEGORIES = {
+  domain: {
+    description: 'Business domain tags',
+    examples: ['authentication', 'payments', 'notifications', 'user-management']
+  },
+  stack: {
+    description: 'Technology stack tags',
+    examples: ['php', 'symfony', 'node', 'react', 'postgresql', 'redis']
+  },
+  pattern: {
+    description: 'Design pattern tags',
+    examples: ['repository', 'factory', 'observer', 'cqrs', 'event-sourcing']
+  },
+  lifecycle: {
+    description: 'Development lifecycle tags',
+    examples: ['legacy', 'stable', 'experimental', 'deprecated']
   }
-  return sets;
+};
+
+/**
+ * Validate the intent field in frontmatter.
+ * @param {string} intent - The intent value from frontmatter
+ * @returns {{ valid: boolean, message: string }}
+ */
+export function validateIntent(intent) {
+  if (!intent) {
+    return { valid: false, message: 'Missing required field: intent' };
+  }
+
+  if (!VALID_INTENTS.includes(intent)) {
+    return {
+      valid: false,
+      message: `Invalid intent '${intent}'. Valid intents: ${VALID_INTENTS.join(', ')}`
+    };
+  }
+
+  return { valid: true, message: '' };
 }
 
 /**
- * Validate a context file's tags object against the taxonomy.
- * Returns: { valid: boolean, unknown: Array<{tag, category}>, approved: object }
+ * Validate tags in frontmatter.
+ * This is a loose validation - tags are freeform but should be organized by category.
+ * @param {object | string[]} tags - Tags from frontmatter (object with categories or flat array)
+ * @returns {{ valid: boolean, warnings: string[] }}
  */
-function validateTags(tagsObject, approvedSets) {
-  const unknown = [];
-  const approved = {};
+export function validateTags(tags) {
+  const warnings = [];
 
-  for (const [category, tagList] of Object.entries(tagsObject || {})) {
-    if (!Array.isArray(tagList)) continue;
-    approved[category] = [];
+  if (!tags) {
+    return { valid: true, warnings: ['No tags defined'] };
+  }
 
-    for (const tag of tagList) {
-      if (approvedSets[category]?.has(tag)) {
-        approved[category].push(tag);
-      } else {
-        unknown.push({ tag, category });
+  // Handle flat array of tags (legacy format)
+  if (Array.isArray(tags)) {
+    return {
+      valid: true,
+      warnings: ['Tags are in flat array format. Consider organizing by category.']
+    };
+  }
+
+  // Validate categorized tags
+  if (typeof tags === 'object') {
+    for (const category of Object.keys(tags)) {
+      if (!TAG_CATEGORIES[category]) {
+        warnings.push(`Unknown tag category: '${category}'`);
       }
     }
   }
 
-  return {
-    valid: unknown.length === 0,
-    unknown,
-    approved
-  };
+  return { valid: true, warnings };
 }
 
 /**
- * Given a set of unknown tags, build the tags-pending-approval array
- * and the proposal payload for the context-standards dispatch.
+ * Get a summary of valid taxonomy values for documentation.
+ * @returns {string}
  */
-function buildPendingProposals(unknownTags, contextFilePath, reason = '') {
-  return unknownTags.map(({ tag, category }) => ({
-    tag,
-    category,
-    reason: reason || `Tag encountered in ${contextFilePath} — not yet in approved taxonomy`,
-    source_file: contextFilePath
-  }));
+export function getTaxonomySummary() {
+  let summary = '## Valid Intents\n\n';
+  for (const intent of VALID_INTENTS) {
+    summary += `- ${intent}\n`;
+  }
+
+  summary += '\n## Tag Categories\n\n';
+  for (const [category, info] of Object.entries(TAG_CATEGORIES)) {
+    summary += `### ${category}\n`;
+    summary += `${info.description}\n`;
+    summary += `Examples: ${info.examples.join(', ')}\n\n`;
+  }
+
+  return summary;
 }
 
-module.exports = { fetchTaxonomy, buildApprovedTagSets, validateTags, buildPendingProposals };

@@ -1,69 +1,82 @@
 /**
  * utils/frontmatter.js
- * Parse, read, and update YAML frontmatter in .context/*.md files
+ * Parse and serialize YAML frontmatter in .context/*.md files.
+ * Uses js-yaml (pure JS, no native bindings).
  */
 
-const yaml = require('js-yaml');
+import yaml from 'js-yaml';
+import * as core from '@actions/core';
 
-const FRONTMATTER_REGEX = /^---\n([\s\S]+?)\n---\n/;
+const FRONTMATTER_REGEX = /^---\r?\n([\s\S]+?)\r?\n---\r?\n/;
+
+const REQUIRED_FIELDS = ['title', 'intent', 'covers-paths', 'last-updated'];
 
 /**
  * Parse frontmatter from a markdown string.
- * @returns {{ frontmatter: object, body: string } | null}
+ * @param {string} fileContent - Full markdown file content
+ * @returns {{ meta: object, body: string } | null} - Parsed frontmatter and body, or null if invalid
  */
-function parseFrontmatter(content) {
-  const match = content.match(FRONTMATTER_REGEX);
-  if (!match) return null;
+export function parse(fileContent) {
+  const match = fileContent.match(FRONTMATTER_REGEX);
+  if (!match) {
+    return null;
+  }
 
   try {
-    const frontmatter = yaml.load(match[1]);
-    const body = content.slice(match[0].length);
-    return { frontmatter, body };
+    const meta = yaml.load(match[1]);
+    const body = fileContent.slice(match[0].length);
+    return { meta, body };
   } catch (e) {
-    console.error('Failed to parse frontmatter:', e.message);
+    core.warning(`Failed to parse YAML frontmatter: ${e.message}`);
     return null;
   }
 }
 
 /**
- * Rebuild a markdown file with updated frontmatter.
- * Preserves the body content exactly.
+ * Serialize frontmatter and body back to a markdown string.
+ * @param {object} meta - Frontmatter object
+ * @param {string} body - Markdown body content
+ * @returns {string} - Full markdown file content
  */
-function serializeFrontmatter(frontmatter, body) {
-  const fm = yaml.dump(frontmatter, {
+export function serialize(meta, body) {
+  const yamlStr = yaml.dump(meta, {
     lineWidth: 120,
     quotingType: '"',
     forceQuotes: false,
-    noRefs: true
+    noRefs: true,
+    sortKeys: false
   });
-  return `---\n${fm}---\n${body}`;
+  return `---\n${yamlStr}---\n${body}`;
 }
 
 /**
- * Update specific frontmatter fields without touching the body.
- * @param {string} content - full file content
- * @param {object} updates - key/value pairs to merge into frontmatter
- * @returns {string} updated file content
+ * Validate that frontmatter contains all required fields.
+ * @param {object} meta - Frontmatter object
+ * @returns {{ valid: boolean, missing: string[] }}
  */
-function updateFrontmatter(content, updates) {
-  const parsed = parseFrontmatter(content);
-  if (!parsed) {
-    throw new Error('Cannot update frontmatter: no valid frontmatter block found');
+export function validate(meta) {
+  if (!meta || typeof meta !== 'object') {
+    return { valid: false, missing: REQUIRED_FIELDS };
   }
 
-  const updated = { ...parsed.frontmatter, ...updates };
-  return serializeFrontmatter(updated, parsed.body);
+  const missing = REQUIRED_FIELDS.filter(field => !(field in meta));
+  return {
+    valid: missing.length === 0,
+    missing
+  };
 }
 
 /**
- * Stamp the last-updated fields on a context file.
- * Called after the AI has updated a file's content.
+ * Update the last-updated field in frontmatter to today's date.
+ * @param {object} meta - Frontmatter object
+ * @param {string} [today] - Date string in YYYY-MM-DD format (defaults to today)
+ * @returns {object} - Updated frontmatter object
  */
-function stampLastUpdated(content, commitSha, date) {
-  return updateFrontmatter(content, {
-    'last-updated-date': date || new Date().toISOString().split('T')[0],
-    'last-updated-commit': commitSha
-  });
+export function updateLastUpdated(meta, today = null) {
+  const dateStr = today || new Date().toISOString().split('T')[0];
+  return {
+    ...meta,
+    'last-updated': dateStr
+  };
 }
 
-module.exports = { parseFrontmatter, serializeFrontmatter, updateFrontmatter, stampLastUpdated };

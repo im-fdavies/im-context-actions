@@ -1,34 +1,50 @@
 /**
  * stale-check.js
- * Finds context docs that haven't been updated within the stale threshold
- * and re-verifies them against the current codebase.
+ * Entrypoint for the context stale check workflow.
  *
- * Run by: .github/workflows/context-stale-check.yml (weekly schedule)
+ * Runs on a schedule to identify context docs that haven't been updated
+ * within the stale threshold and verifies them against current source code.
  */
 
-const fs = require('fs');
-const path = require('path');
-const { execSync } = require('child_process');
+import fs from 'fs';
+import path from 'path';
+import { execSync } from 'child_process';
+import * as core from '@actions/core';
+import yaml from 'js-yaml';
 
-const { loadContextCoverageMap, readChangedFileContents } = require('./utils/diff-mapper');
-const { parseFrontmatter, stampLastUpdated, updateFrontmatter } = require('./utils/frontmatter');
-const { callAI } = require('./utils/ai-client');
-const { fetchTaxonomy, buildApprovedTagSets, validateTags, buildPendingProposals } = require('./utils/taxonomy');
+import { parse, serialize, updateLastUpdated } from './utils/frontmatter.js';
+import { verifyContextDoc, delay } from './utils/ai-client.js';
+import { createCommit, findOpenIssue, createIssue } from './utils/github-client.js';
 
+// -----------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------
 const REPO_ROOT = process.cwd();
-const STANDARDS_REPO = process.env.STANDARDS_REPO || '';
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
-const STALE_THRESHOLD_DAYS = parseInt(process.env.STALE_THRESHOLD_DAYS || '30');
-const FORCE_ALL = process.env.FORCE_ALL === 'true';
-const TODAY = new Date().toISOString().split('T')[0];
+const CONTEXT_DIR = path.join(REPO_ROOT, '.context');
+const MAX_FILE_CHARS = 6000;
+const MAX_TOTAL_CHARS = 40000;
+const CONFIDENCE_THRESHOLD = 0.85;
+const DRY_RUN = process.env.DRY_RUN === 'true';
 
-function setOutput(name, value) {
-  const outputFile = process.env.GITHUB_OUTPUT;
-  if (outputFile) {
-    fs.appendFileSync(outputFile, `${name}=${typeof value === 'string' ? value : JSON.stringify(value)}\n`);
-  }
+// -----------------------------------------------------------------------
+// Environment variables (set by the workflow)
+// -----------------------------------------------------------------------
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const CONTEXT_STANDARDS_PAT = process.env.CONTEXT_STANDARDS_PAT;
+const GITHUB_REPOSITORY = process.env.GITHUB_REPOSITORY || '';
+const GITHUB_REF_NAME = process.env.GITHUB_REF_NAME || 'main';
+
+// -----------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------
+
+function getToday() {
+  return new Date().toISOString().split('T')[0];
 }
 
+/**
+ * Calculate days since a date string.
+ */
 function daysSince(dateStr) {
   if (!dateStr) return 9999;
   const then = new Date(dateStr);
@@ -36,162 +52,362 @@ function daysSince(dateStr) {
   return Math.floor((now - then) / (1000 * 60 * 60 * 24));
 }
 
-function buildStaleCheckPrompt(contextDoc, currentFileContents, approvedTagSets) {
-  const approvedTagsSummary = Object.entries(approvedTagSets)
-    .map(([cat, set]) => `${cat}: [${Array.from(set).join(', ')}]`)
-    .join('\n');
-
-  const filesFormatted = currentFileContents
-    .map(f => `### ${f.path}\n\`\`\`\n${f.content}\n\`\`\``)
-    .join('\n\n');
-
-  return `You are auditing a context documentation file to verify it is still accurate.
-
-## Context Document (may be stale)
-
-File: ${contextDoc.relativePath}
-Last updated: ${contextDoc.frontmatter['last-updated-date'] || 'unknown'}
-
-Current content:
----
-${require('js-yaml').dump(contextDoc.frontmatter)}---
-${contextDoc.body}
-
----
-
-## Current Source Files This Document Covers
-
-${filesFormatted}
-
----
-
-## Approved Taxonomy Tags
-
-${approvedTagsSummary}
-
----
-
-TASK:
-1. Compare the context document against the current source files.
-2. Identify any inaccuracies, outdated references, missing patterns, or incorrect code examples.
-3. Return the fully corrected context document.
-4. If the document is still accurate with no changes needed, respond with exactly: STILL_ACCURATE
-5. Set confidence score honestly based on how thoroughly you verified it.
-6. Only update sections that are actually wrong — preserve accurate sections exactly.
-7. Return ONLY the updated markdown content or STILL_ACCURATE. No explanation.`;
+/**
+ * Load the context.config.yml file.
+ */
+function loadConfig() {
+  const configPath = path.join(REPO_ROOT, 'context.config.yml');
+  if (!fs.existsSync(configPath)) {
+    throw new Error('context.config.yml not found at repo root');
+  }
+  return yaml.load(fs.readFileSync(configPath, 'utf8'));
 }
 
-async function main() {
-  console.log(`\n=== Context Stale Check ===`);
-  console.log(`Stale threshold: ${STALE_THRESHOLD_DAYS} days`);
-  console.log(`Force all: ${FORCE_ALL}`);
-
-  // Load taxonomy
-  let approvedTagSets = {};
-  try {
-    const taxonomy = await fetchTaxonomy(STANDARDS_REPO, GITHUB_TOKEN);
-    approvedTagSets = buildApprovedTagSets(taxonomy);
-    console.log(`✓ Taxonomy loaded`);
-  } catch (e) {
-    console.warn(`⚠ Could not fetch taxonomy: ${e.message}`);
+/**
+ * Load all context docs from .context/ directory.
+ */
+function loadContextDocs() {
+  if (!fs.existsSync(CONTEXT_DIR)) {
+    return [];
   }
 
-  // Load all context docs
-  const allDocs = loadContextCoverageMap(REPO_ROOT);
-  console.log(`Found ${allDocs.length} context docs`);
+  const files = fs.readdirSync(CONTEXT_DIR).filter(f => f.endsWith('.md'));
+  const docs = [];
 
-  // Filter to stale ones
-  const staleDocs = FORCE_ALL
-    ? allDocs
-    : allDocs.filter(doc => {
-        // Skip append-only files
-        if (doc.frontmatter?.tags?.sensitivity?.includes('append-only')) return false;
-        if (doc.relativePath.includes('constraints-and-gotchas')) return false;
+  for (const filename of files) {
+    const filePath = path.join(CONTEXT_DIR, filename);
+    const content = fs.readFileSync(filePath, 'utf8');
+    const parsed = parse(content);
 
-        const age = daysSince(doc.frontmatter?.['last-updated-date']);
-        const isStale = age > STALE_THRESHOLD_DAYS;
-        if (isStale) console.log(`  Stale (${age}d): ${doc.relativePath}`);
-        return isStale;
-      });
+    if (!parsed) {
+      core.warning(`Skipping ${filename}: invalid or missing frontmatter`);
+      continue;
+    }
 
-  console.log(`\nDocs to check: ${staleDocs.length}`);
+    docs.push({
+      path: `.context/${filename}`,
+      filePath,
+      filename,
+      content,
+      meta: parsed.meta,
+      body: parsed.body,
+      coversPaths: parsed.meta['covers-paths'] || [],
+      lastUpdated: parsed.meta['last-updated']
+    });
+  }
 
-  if (staleDocs.length === 0) {
-    console.log('Nothing stale — exiting');
-    setOutput('files_updated', 'false');
-    setOutput('updated_files_list', '');
+  return docs;
+}
+
+/**
+ * Read source files covered by a context doc.
+ */
+function readSourceFiles(coversPaths, maxTotalChars = MAX_TOTAL_CHARS) {
+  const files = [];
+  let totalChars = 0;
+
+  for (const pattern of coversPaths) {
+    try {
+      const matches = execSync(`git ls-files "${pattern}" 2>/dev/null || true`, { encoding: 'utf8' })
+        .trim()
+        .split('\n')
+        .filter(Boolean);
+
+      for (const filePath of matches) {
+        if (totalChars >= maxTotalChars) break;
+
+        const fullPath = path.join(REPO_ROOT, filePath);
+        if (!fs.existsSync(fullPath)) continue;
+
+        try {
+          let content = fs.readFileSync(fullPath, 'utf8');
+
+          if (content.length > MAX_FILE_CHARS) {
+            content = content.slice(0, MAX_FILE_CHARS) + '\n\n[... truncated ...]';
+          }
+
+          if (totalChars + content.length > maxTotalChars) {
+            const remaining = maxTotalChars - totalChars;
+            content = content.slice(0, remaining) + '\n\n[... truncated for budget ...]';
+          }
+
+          files.push({ path: filePath, content });
+          totalChars += content.length;
+        } catch (e) {
+          core.warning(`Failed to read ${filePath}: ${e.message}`);
+        }
+      }
+    } catch {
+      // Pattern didn't match anything
+    }
+  }
+
+  return files;
+}
+
+/**
+ * Check if a file is append-only (constraints-and-gotchas).
+ */
+function isAppendOnly(filename) {
+  return filename.includes('constraints-and-gotchas');
+}
+
+// -----------------------------------------------------------------------
+// Main
+// -----------------------------------------------------------------------
+
+async function main() {
+  const today = getToday();
+
+  core.info('=== Context Stale Check ===');
+  core.info(`Date: ${today}`);
+  core.info(`Repository: ${GITHUB_REPOSITORY}`);
+  core.info(`Dry run: ${DRY_RUN}`);
+
+  // Load config
+  const config = loadConfig();
+  const staleThresholdDays = config.context?.stale_threshold_days || 90;
+  
+  // AI config - read from config file
+  const aiConfig = config.context?.ai || {};
+  const provider = aiConfig.provider || 'openai';
+  const model = aiConfig.model || 'gpt-4o';
+  const apiKeySecretName = aiConfig.api_key_secret || 'OPENAI_API_KEY';
+  const apiKey = process.env[apiKeySecretName] || process.env.AI_API_KEY || process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY;
+
+  core.info(`Stale threshold: ${staleThresholdDays} days`);
+  core.info(`AI provider: ${provider}, model: ${model}`);
+
+  // Load context docs
+  const contextDocs = loadContextDocs();
+  core.info(`Context docs found: ${contextDocs.length}`);
+
+  if (contextDocs.length === 0) {
+    core.info('No context docs found in .context/ - nothing to check');
+    core.setOutput('files_updated', 'false');
     return;
   }
 
+  // Filter to stale docs
+  const staleDocs = contextDocs.filter(doc => {
+    const age = daysSince(doc.lastUpdated);
+    const isStale = age > staleThresholdDays;
+    if (isStale) {
+      core.info(`  Stale (${age} days): ${doc.filename}`);
+    }
+    return isStale;
+  });
+
+  core.info(`\nStale docs to check: ${staleDocs.length}`);
+
+  if (staleDocs.length === 0) {
+    core.info('No stale context docs - nothing to check');
+    core.setOutput('files_updated', 'false');
+    return;
+  }
+
+  // Process each stale doc
   const updatedFiles = [];
+  const issuesOpened = [];
+  const errors = [];
+  let checked = 0;
+  let refreshed = 0;
+  let flagged = 0;
+  let skipped = 0;
+
+  const [owner, repo] = GITHUB_REPOSITORY.split('/');
+  const token = CONTEXT_STANDARDS_PAT || GITHUB_TOKEN;
 
   for (const doc of staleDocs) {
-    console.log(`\nChecking: ${doc.relativePath}`);
+    checked++;
+    core.info(`\nChecking: ${doc.filename}`);
+    core.info(`  Last updated: ${doc.lastUpdated || 'unknown'}`);
 
-    // Read the current versions of the source files this doc covers
-    const coveredPaths = doc.coversPaths || [];
-    const sourceFiles = [];
-
-    for (const pattern of coveredPaths) {
-      try {
-        // Expand glob to actual files using git ls-files
-        const files = execSync(`git ls-files "${pattern}" 2>/dev/null || find . -path "./${pattern}" -type f 2>/dev/null`)
-          .toString().trim().split('\n').filter(Boolean);
-
-        for (const f of files.slice(0, 10)) { // cap at 10 files per pattern
-          if (fs.existsSync(f)) {
-            const content = fs.readFileSync(f, 'utf8');
-            sourceFiles.push({
-              path: f,
-              content: content.length > 6000 ? content.slice(0, 6000) + '\n[...truncated]' : content
-            });
-          }
-        }
-      } catch {
-        // Pattern didn't match anything — skip
-      }
-    }
+    // Read source files
+    const sourceFiles = readSourceFiles(doc.coversPaths);
+    core.info(`  Source files read: ${sourceFiles.length}`);
 
     if (sourceFiles.length === 0) {
-      console.log('  No source files found for covered paths — skipping');
+      core.warning(`  No source files found for covers-paths - skipping`);
+      skipped++;
+      continue;
+    }
+
+    if (DRY_RUN) {
+      core.info(`  [DRY RUN] Would verify this doc`);
       continue;
     }
 
     try {
-      const response = await callAI(
-        `You are auditing technical documentation for accuracy. Be thorough but conservative — only flag genuine inaccuracies, not stylistic preferences.`,
-        buildStaleCheckPrompt(doc, sourceFiles, approvedTagSets)
-      );
+      core.info(`  Verifying with ${provider} API...`);
+      const result = await verifyContextDoc(doc.content, sourceFiles, { provider, model, apiKey });
 
-      if (response.trim() === 'STILL_ACCURATE') {
-        console.log('  ✓ Still accurate — just stamping date');
-        // Still stamp the last-updated fields so we reset the stale clock
-        const fullContent = fs.readFileSync(doc.contextFilePath, 'utf8');
-        const stamped = stampLastUpdated(fullContent, 'stale-check', TODAY);
-        fs.writeFileSync(doc.contextFilePath, stamped);
-        updatedFiles.push(doc.relativePath);
+      core.info(`  Accurate: ${result.accurate}, Confidence: ${result.confidence.toFixed(2)}`);
+      if (result.issues.length > 0) {
+        core.info(`  Issues: ${result.issues.join('; ')}`);
+      }
+
+      // Handle append-only files differently
+      if (isAppendOnly(doc.filename)) {
+        if (!result.accurate || result.confidence < CONFIDENCE_THRESHOLD) {
+          // Open issue but don't modify
+          const issueTitle = `[context] Stale doc needs review: ${doc.path}`;
+
+          const existingIssue = await findOpenIssue({ owner, repo, title: issueTitle, token });
+          if (existingIssue) {
+            core.info(`  Issue already exists: #${existingIssue.number}`);
+          } else {
+            const issueBody = `## Stale Context Document
+
+**File:** \`${doc.path}\`
+**Last updated:** ${doc.lastUpdated || 'unknown'}
+**Confidence:** ${result.confidence.toFixed(2)}
+
+### Issues Found
+
+${result.issues.map(i => `- ${i}`).join('\n')}
+
+### Action Required
+
+This is an append-only file (\`constraints-and-gotchas\`) and cannot be auto-modified.
+Please review and update manually if needed.
+
+---
+*This issue was automatically created by the context stale check workflow.*`;
+
+            const issue = await createIssue({
+              owner,
+              repo,
+              title: issueTitle,
+              body: issueBody,
+              labels: ['context-stale'],
+              token
+            });
+            core.info(`  ✓ Opened issue: #${issue.number}`);
+            issuesOpened.push(doc.path);
+            flagged++;
+          }
+        } else {
+          core.info(`  Append-only file is still accurate - no action needed`);
+        }
         continue;
       }
 
-      const stamped = stampLastUpdated(response, 'stale-check', TODAY);
-      fs.writeFileSync(doc.contextFilePath, stamped);
-      updatedFiles.push(doc.relativePath);
-      console.log(`  ✓ Updated`);
+      // Standard doc handling
+      if (result.accurate && result.confidence >= CONFIDENCE_THRESHOLD) {
+        // Still accurate - just bump the date
+        const updatedMeta = updateLastUpdated(doc.meta, today);
+        const updatedContent = serialize(updatedMeta, doc.body);
+        fs.writeFileSync(doc.filePath, updatedContent);
+        updatedFiles.push(doc.path);
+        refreshed++;
+        core.info(`  ✓ Refreshed (still accurate)`);
+      } else {
+        // Not accurate or low confidence - open an issue
+        const issueTitle = `[context] Stale doc needs review: ${doc.path}`;
+
+        const existingIssue = await findOpenIssue({ owner, repo, title: issueTitle, token });
+        if (existingIssue) {
+          core.info(`  Issue already exists: #${existingIssue.number}`);
+        } else {
+          const issueBody = `## Stale Context Document
+
+**File:** \`${doc.path}\`
+**Last updated:** ${doc.lastUpdated || 'unknown'}
+**Confidence:** ${result.confidence.toFixed(2)}
+
+### Issues Found
+
+${result.issues.length > 0 ? result.issues.map(i => `- ${i}`).join('\n') : '- Low confidence in accuracy assessment'}
+
+### Action Required
+
+Please review this context document and update it to reflect the current state of the source code.
+
+---
+*This issue was automatically created by the context stale check workflow.*`;
+
+          const issue = await createIssue({
+            owner,
+            repo,
+            title: issueTitle,
+            body: issueBody,
+            labels: ['context-stale'],
+            token
+          });
+          core.info(`  ✓ Opened issue: #${issue.number}`);
+          issuesOpened.push(doc.path);
+          flagged++;
+        }
+      }
+
+      // Rate limit delay
+      await delay(1500);
 
     } catch (e) {
-      console.error(`  ✗ Failed: ${e.message}`);
+      core.error(`  ✗ Failed: ${e.message}`);
+      errors.push({ file: doc.filename, error: e.message });
     }
   }
 
-  setOutput('files_updated', (updatedFiles.length > 0).toString());
-  setOutput('updated_files_list', updatedFiles.join(', '));
+  // Summary
+  core.info('\n=== Summary ===');
+  core.info(`Files checked: ${checked}`);
+  core.info(`Files refreshed: ${refreshed}`);
+  core.info(`Files flagged: ${flagged}`);
+  core.info(`Files skipped: ${skipped}`);
+  core.info(`Errors: ${errors.length}`);
 
-  console.log(`\n=== Done ===`);
-  console.log(`Files checked: ${staleDocs.length}`);
-  console.log(`Files updated: ${updatedFiles.length}`);
+  if (errors.length > 0) {
+    core.warning('Errors encountered:');
+    for (const err of errors) {
+      core.warning(`  ${err.file}: ${err.error}`);
+    }
+  }
+
+  // Commit changes if any
+  if (updatedFiles.length > 0 && !DRY_RUN) {
+    core.info('\nCommitting changes...');
+
+    const filesToCommit = updatedFiles.map(p => ({
+      path: p,
+      content: fs.readFileSync(path.join(REPO_ROOT, p), 'utf8')
+    }));
+
+    try {
+      const result = await createCommit({
+        owner,
+        repo,
+        branch: GITHUB_REF_NAME,
+        files: filesToCommit,
+        message: `chore(context): refresh stale context docs [skip ci]\n\nRefreshed: ${updatedFiles.join(', ')}`,
+        token
+      });
+
+      if (result) {
+        core.info(`✓ Committed: ${result.sha}`);
+      } else {
+        core.info('No changes to commit');
+      }
+    } catch (e) {
+      core.error(`Failed to commit: ${e.message}`);
+    }
+  }
+
+  // Set outputs
+  core.setOutput('files_updated', (updatedFiles.length > 0).toString());
+  core.setOutput('updated_files', updatedFiles.join(','));
+  core.setOutput('issues_opened', issuesOpened.join(','));
+  core.setOutput('files_checked', checked.toString());
+  core.setOutput('files_refreshed', refreshed.toString());
+  core.setOutput('files_flagged', flagged.toString());
+  core.setOutput('errors', errors.length.toString());
 }
 
+// Run
 main().catch(e => {
-  console.error('Stale check failed:', e);
+  core.error(`Stale check action failed: ${e.message}`);
+  core.setFailed(e.message);
   process.exit(1);
 });
+
